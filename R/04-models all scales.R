@@ -1,0 +1,136 @@
+
+##Script for logistic regression models for all scales of observation
+#Landscape and home range scales are combined, but the complex iSSA model for the patch scale 
+  #is exported separately
+
+libs<-c('amt','data.table','rsq', 'texreg','arm','lme4','dplyr','Hmisc')
+lapply(libs, require, character.only = TRUE)
+
+#read in files already prepared in previous scripts
+landscape<-readRDS("Cleaned/lnRSFsetup.rds")
+homerange<-readRDS("Cleaned/hrRSFsetup.rds")
+patch<-readRDS("Cleaned/iSSAsetup.rds")
+PPandOMP<-readRDS("Cleaned/LandscapeAvailable.rds")
+
+#getting the number of used and available locations at each individual in home range models
+SampleUsed<- homerange[Status=="TRUE", length(Status), by=ID]
+setnames(SampleUsed, "V1", "Used")
+SampleAvail<- homerange[Status=="FALSE", length(Status), by=ID]
+setnames(SampleAvail, "V1", "Avail")
+#combining into one datatable of sample sizes for each individual
+SampleSize<- merge(SampleUsed, SampleAvail, by="ID")
+
+##Function which runs an RSF, extracts coefficients, and extracts standard error
+#Can be used on the landscape and homerange scales
+CNRSF <- function(yvar, xvar1, xvar2) {
+  # Make the model
+  model <- glm(yvar ~ xvar1 * xvar2, family = binomial(link = 'logit'))
+  # Transpose the coef of the model and cast as data.table
+  coefOut <- data.table(t(coef(model)))
+  # Transpose the standard error coef of the model and cast as data.table
+  secoefOut <- data.table(t(se.coef(model)))
+  #extract r-squared from model
+  rsqOut <- data.table(rsq(model))
+  #label the column name for the rsqOut
+  names(rsqOut)<-c("rsq")
+  # Add 'se-' prefix to standard error coef table
+  setnames(secoefOut, paste0('se-', colnames(secoefOut)))
+  # Return combined columns
+  return(data.table(coefOut, secoefOut, rsqOut))
+}
+
+#Run landscape RSF across combined PP and OMP
+bothlandscapeOUT <- landscape[, CNRSF(xvar1 = C, xvar2 = N, yvar = Status)]
+bothlandscapeOUT[, Zone:=NA]
+bothlandscapeOUT[, ID:=NA]
+bothlandscapeOUT[, Scale:="Landscape"]
+
+#Run landscape RSF on each PP and OMP separately
+landscapeOUT <- landscape[, CNRSF(xvar1 = C, xvar2 = N, yvar = Status), by = Zone]
+landscapeOUT[, ID:=NA]
+landscapeOUT[, Scale:="Landscape"]
+
+#Run function by ID 
+homeOUT <- homerange[, CNRSF(xvar1 = C, xvar2 = N, yvar = Status), by = ID]
+homeOUT[, Zone:=(tstrsplit(ID,"M0",keep = 1))]
+homeOUT[, Scale:="Homerange"]
+
+#Run function across all ID's
+fullhomeOUT <- homerange[, CNRSF(xvar1=C, xvar2=N, yvar=Status)]
+fullhomeOUT[, ID:="FULL"]
+fullhomeOUT[, Zone:=NA]
+fullhomeOUT[, Scale:="Homerange"]
+
+#merge the landscape and homerange scale RSFs
+homelandRSF<-rbindlist(list(landscapeOUT, bothlandscapeOUT, homeOUT, fullhomeOUT), use.names = TRUE , fill=TRUE)
+names(homelandRSF)<-c("Zone", "Intercept", "Ccoef", "Ncoef", "CxNcoef", "Intercept-se", "Cse", "Nse", "CxNse", "rsq", "ID","Scale")
+
+#Using standard errors to creat max and min columns
+homelandRSF$Cmax<-homelandRSF$Ccoef+homelandRSF$Cse
+homelandRSF$Cmin<-homelandRSF$Ccoef-homelandRSF$Cse
+homelandRSF$Nmax<-homelandRSF$Ncoef+homelandRSF$Nse
+homelandRSF$Nmin<-homelandRSF$Ncoef-homelandRSF$Nse
+homelandRSF$CxNmax<-homelandRSF$CxNcoef+homelandRSF$CxNse
+homelandRSF$CxNmin<-homelandRSF$CxNcoef-homelandRSF$CxNse
+
+#adding in the sample sizes to the fnal datasheet
+homelandRSF<- merge(homelandRSF, SampleSize, by="ID", all.x = TRUE)
+
+#Function for the iSSA at the patch scale, also prints summaries
+  #I have summaries printed because I have yet to figure out how to extract the 
+  #standard errors and r squares from the clogit function
+  #plan to manually enter the standard errors and rsquares into spreadsheet until I figure it out
+CNiSSA<-function(yvar, xvar1, xvar2, xvar3, xvar4, strata1) {
+  # Make the model
+  model <- clogit(yvar ~ xvar1*xvar2 + xvar3*xvar1 + xvar3*xvar2 + xvar4*xvar1 + xvar4*xvar2 + xvar3*xvar4 + strata(strata1))
+  # Transpose the coef of the model and cast as data.table
+  coefOut <- data.table(t(coef(model)))
+  # Return combined columns
+  print(summary(model))
+  return(data.table(coefOut))
+}
+
+#run iSSA model by ID
+patchOUT<- patch[, CNiSSA(xvar1 = C, xvar2 = N, yvar = case_, xvar3=log_sl, xvar4=cos_ta, strata1=ind.step.id), by = ID]
+patchOUT[, Zone:=(tstrsplit(ID,"M0",keep = 1))]
+patchOUT[, Scale:="Patch"]
+
+#run iSSA across all individuals
+fullpatchOUT <- patch[, CNiSSA(xvar1 = C, xvar2 = N, yvar = case_, xvar3=log_sl, xvar4=cos_ta, strata1=ind.step.id)]
+fullpatchOUT[, Zone:=NA]
+fullpatchOUT[, ID:= NA]
+fullpatchOUT[, Scale:="Patch"]
+
+#combine the coef of both model results
+patchRSF<-rbindlist(list(patchOUT, fullpatchOUT), use.names = TRUE , fill=TRUE)
+names(patchRSF)<-c("ID", "Ccoef", "Ncoef","SLcoef","TAcoef", "CxNcoef", "CxSL", "NxSL", "CxTA", "NxTA", "SLxTA", "Zone", "Scale")
+
+
+#run correlations between C and N for each landscapes and home ranges
+
+#Creat just the OMP datatable for the correlations
+OMPCN<-PPandOMP[Zone=="OMP"]
+#create just the PP datatable for the correlations
+PPCN<-PPandOMP[Zone=="PP"]
+
+#correlation across both landscapes combined
+PPandOMPcorr<-PPandOMP[, cor(C, N)]
+#correlation across the PP landscape
+PPcorr<-PPCN[, cor(C, N)]
+#correlation across the OMP landscape
+OMPcorr<-OMPCN[, cor(C, N)]
+#correlation across each home range. hence the "by=ID"
+homerangecorr<-homerange[, cor(C, N), by=ID]
+names(homerangecorr)<-c("ID","CorCoef")
+homerangecorr$CorCoef<-round(homerangecorr$CorCoef, 3)
+
+
+#exporting the results from the landscape and homerange scale RSFs
+fwrite(homelandRSF,"Output/homeandlandscapeRESULTS.csv")
+#export patch issa results
+fwrite(patchRSF,"Output/patchRESULTS.csv")
+#export 
+fwrite(homerangecorr, "Output/homerangeCORRELATIONS.csv")
+
+
+
